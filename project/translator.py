@@ -1,7 +1,7 @@
 from requests import Session, Response
 from bs4 import BeautifulSoup as bs
 import argparse
-
+import time
 
 class OnlineTranslator:
     def __init__(self):
@@ -115,4 +115,6 @@ class OnlineTranslator:
 
 if __name__ == "__main__":
     Translator = OnlineTranslator()
+    start = time.time()
     Translator.menu()
+    print(f'Time taken {time.time() - start}')
