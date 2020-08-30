@@ -53,7 +53,9 @@ class Translator:
     async def fetch(self, client: ClientSession, url: str) -> str:
         async with client.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:79.0) Gecko/20100101 Firefox/79.0"
+            },
         ) as response:
             if response.status == 404:
                 click.echo(f"Sorry, unable to find the translation for '{self.word}'.")
