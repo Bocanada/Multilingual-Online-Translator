@@ -1,137 +1,147 @@
-from asyncio import AbstractEventLoop, get_event_loop, Task
-from time import time
-from typing import List, NamedTuple, Optional, Set, Tuple, Iterator
-from aiohttp import ClientSession
-from colorama import Fore, Style
+from __future__ import annotations
+
+import asyncio
+from collections import namedtuple
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
+from typing import Iterable
+
 from bs4 import BeautifulSoup as bs
-import click
+from click import Choice, command, option
+from httpx import AsyncClient
+from rich.console import Console
+
+console = Console()
+print = console.print
+
+TranslationData = namedtuple(
+    "TranslationData",
+    ["examples_original", "examples_translated", "translations", "language"],
+)
 
 
-class Data(NamedTuple):
-    examples: Iterator[Tuple[str, str]]
-    translations: List[str]
-    language: str
+def soup(
+    task: tuple[bytes, str] | None = None,
+    res_content: bytes = None,
+    lang: str = None,
+    n: int = 6,
+) -> TranslationData:
+    if (not res_content or not lang) and task:
+        res_content, lang = task
+    assert res_content and lang
+    sopita = bs(res_content, "html5lib")
+    examples_original: tuple[str, ...] = tuple(
+        f"{r.text.strip()}:" for r in sopita.select("#examples-content .example > .src")
+    )[:n]
+    examples_translated: tuple[str, ...] = tuple(
+        r.text.strip() for r in sopita.select("#examples-content .example > .trg")
+    )[:n]
+    translations: tuple[str, ...] = tuple(
+        r.text.strip().split("  ")[0]
+        for r in sopita.select("#translations-content > .translation, .translation.rtl")
+    )[:n]
+    return TranslationData(
+        iter(examples_original),
+        iter(examples_translated),
+        iter(translations),
+        lang.capitalize(),
+    )
 
 
+def client():
+    return AsyncClient(
+        base_url="https://context.reverso.net/translation/",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:79.0)Gecko/20100101 Firefox/79.0"
+            )
+        },
+    )
+
+
+@dataclass
 class Translator:
-    url: str = "https://context.reverso.net/translation/"
-    lang_list: List[str] = [
-        "arabic",
-        "chinese",
-        "german",
-        "english",
-        "french",
-        "hebrew",
-        "japanese",
-        "dutch",
-        "polish",
-        "portuguese",
-        "romanian",
-        "russian",
-        "turkish",
-        "spanish",
-    ]
     word: str
+    lang_list: tuple[str, ...] = field(
+        default=(
+            "arabic",
+            "chinese",
+            "german",
+            "english",
+            "french",
+            "hebrew",
+            "japanese",
+            "dutch",
+            "polish",
+            "portuguese",
+            "romanian",
+            "russian",
+            "turkish",
+            "spanish",
+        ),
+        init=False,
+    )
+    client: AsyncClient = field(default_factory=client, init=False)
 
-    async def get_translations(
-        self, loop: AbstractEventLoop, _from: str, to: Optional[str] = None
-    ) -> None:
-        if to:
-            html: str = await self.call(_from, to)
-            self.Data = Data(*self.soup(html, 5), to)
-            click.echo(self)
-            return
-        tasks: Set[Tuple[Task, str]] = set()
-        self.lang_list.remove(_from)
-        for language in self.lang_list:
-            tasks.add((loop.create_task(self.call(_from, language)), language))
-        for task, lang in tasks:
-            html = await task
-            self.Data = Data(*self.soup(html, 1), lang)
-            click.echo(self)
+    async def gather_tasks(self, from_lang: str) -> Iterable[tuple[bytes, str]]:
+        tasks: tuple[asyncio.Task[bytes], ...] = tuple(
+            asyncio.create_task(self.fetch(from_lang, language), name=language)
+            for language in self.lang_list
+            if language != from_lang
+        )
+        await asyncio.gather(*tasks)
+        result_task = ((task.result(), task.get_name()) for task in tasks)
+        return result_task
 
-    async def fetch(self, client: ClientSession, url: str) -> str:
-        async with client.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:79.0) Gecko/20100101 Firefox/79.0"
-            },
-        ) as response:
-            if response.status == 404:
-                click.echo(f"Sorry, unable to find the translation for '{self.word}'.")
-                raise SystemExit
-            elif response.status != 200:
-                click.echo("There is something wrong with your internet connection.")
-                raise SystemExit
-            return await response.text()
+    async def get_translations(self, _from: str, to: str | None = None) -> None:
+        if to is not None and to != "all":
+            html = await self.fetch(_from, to)
+            data = soup(res_content=html, lang=to)
+            return self.to_stdout(data)
+        result = await self.gather_tasks(_from)
+        with ProcessPoolExecutor() as executor:
+            res = executor.map(soup, result)
+        for data in res:
+            self.to_stdout(data)
+        await self.client.aclose()
 
-    async def call(self, _from: str, _to: str) -> str:
-        async with ClientSession() as session:
-            url = f"{self.url}{_from}-{_to}/{self.word}"
-            return await self.fetch(session, url)
-
-    @staticmethod
-    def soup(txt: str, n: int) -> Tuple[Iterator[Tuple[str, str]], List[str]]:
-        sopita = bs(txt, "html5lib")
-        examples_original: List[str] = [
-            r.text.strip() + ":"
-            for r in sopita.select("#examples-content .example > .src")
-        ][:n]
-        examples_translated: List[str] = [
-            r.text.strip() for r in sopita.select("#examples-content .example > .trg")
-        ][:n]
-
-        translations: List[str] = [
-            r.text.strip().split("  ")[0]
-            for r in sopita.select(
-                "#translations-content > .translation, .translation.rtl"
+    async def fetch(self, from_lang: str, to_lang: str) -> bytes:
+        url = f"{from_lang}-{to_lang}/{self.word}"
+        response = await self.client.get(url)
+        if not response.is_error:
+            return await response.aread()
+        if response.status_code == 404:
+            raise SystemExit(
+                f"Sorry, unable to find the translation for {self.word!r}."
             )
-        ][:n]
-        return zip(examples_original, examples_translated), translations
+        raise SystemExit("There is something wrong with your internet connection.")
 
-    def __repr__(self) -> str:
-        with open(f"{self.word}.txt", "w") as file:
-            click.echo(
-                f"{Style.BRIGHT + Fore.CYAN}{self.Data.language.capitalize()} translations:",
-                file=file,
-                color=True,
-            )
-            for translation in self.Data.translations:
-                click.echo(f'{Fore.WHITE}{translation}', file=file, color=True)
-            click.echo(
-                f"{Style.BRIGHT + Fore.CYAN}{self.Data.language.capitalize()} examples:",
-                file=file,
-                color=True,
-            )
-            for original, translated in self.Data.examples:
-                click.echo(f'{Fore.WHITE}{original}', file=file, color=True)
-                click.echo(f'{Fore.LIGHTYELLOW_EX}{translated}', file=file, color=True)
-        with open(f"{self.word}.txt", "r") as f:
-            return f.read()
+    def to_stdout(self, data: TranslationData):
+        console.print(f"{data.language} translations:", style="bold underline cyan")
+        for translation in data.translations:
+            console.print(translation, style="bold white")
+        console.print(f"{data.language} examples:", style="bold underline cyan")
+        for original, translated in zip(
+            data.examples_original,
+            data.examples_translated,
+        ):
+            console.print(original, style="magenta")
+            console.print(translated, style="bold magenta")
 
 
-@click.command()
-@click.option(
-    '-f',
-    '_from',
-    default='english',
-    type=click.Choice(Translator.lang_list),
+@command()
+@option(
+    "-f",
+    "_from",
+    default="english",
+    type=Choice(Translator.lang_list),
 )
-@click.option(
-    '-t', 'to', type=click.Choice(Translator.lang_list + ['all']), default='all'
-)
-@click.option('-w', 'word', help='The word you want to translate.', required=True)
-def main(_from: str, to: str, word: str) -> None:
-    t = Translator()
-    t.word = word
-    loop: AbstractEventLoop = get_event_loop()
-    t0 = time()
-    click.echo(f"{Fore.BLUE}App started.")
-    if to == 'all':
-        loop.run_until_complete(t.get_translations(loop, _from))
-    else:
-        loop.run_until_complete(t.get_translations(loop, _from, to=to))
-    click.echo(f"{Fore.BLUE}Time taken: {round(time() - t0, 2)}")
+@option("-t", "to", type=Choice(Translator.lang_list + ("all",)), default="all")
+@option("-w", "word", help="The word you want to translate.", required=True)
+def main(_from: str, to: str, word: str = "hello") -> None:
+    t = Translator(word)
+    t.word = word.lower()
+    asyncio.run(t.get_translations(_from, to=to))
 
 
 if __name__ == "__main__":
