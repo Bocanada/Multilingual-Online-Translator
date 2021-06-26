@@ -2,3 +2,5 @@
 .idea
 .mypy_cache
 project/*.txt
+.vscode
+.venv
